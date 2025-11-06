@@ -1,54 +1,352 @@
-name: Terraform
+name: 'Terraform GCS Bucket'
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+    paths:
+      - '*.tf'
+      - '*.tfvars'
+      - '.github/workflows/**'
   pull_request:
+    branches:
+      - main
+    paths:
+      - '*.tf'
+      - '*.tfvars'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.6.0'
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
 
 permissions:
   contents: read
-  id-token: write   # <-- needed for Workload Identity Federation
+  pull-requests: write
+  security-events: write
+  id-token: write
 
 jobs:
-  terraform:
+  detect-changes:
+    name: 'Detect Changes'
     runs-on: ubuntu-latest
-    environment: production
-    defaults:
-      run:
-        shell: bash
+    outputs:
+      terraform-changed: ${{ steps.changes.outputs.terraform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      - name: Detect file changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            terraform:
+              - '*.tf'
+              - '*.tfvars'
+              - '.github/workflows/**'
+
+  validate:
+    name: 'Validate Terraform'
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform-changed == 'true'
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Authenticate to Google Cloud via OIDC (no keys)
-      - name: Auth to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}  # store the provider resource name in a secret
-          service_account: ${{ secrets.GCP_WIF_SA }}                   # store the SA email in a secret
-          # Optional: set the project for gcloud; Terraform reads project from provider config/vars.
-          create_credentials_file: true   # makes ADC available to Terraform
+          terraform_version: ${{ env.TF_VERSION }}
 
-      # (Optional) If you use gcloud in any step:
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+      - name: Terraform Format Check
+        run: |
+          echo "Checking Terraform formatting..."
+          if ! terraform fmt -check -diff; then
+            echo "❌ Terraform files are not properly formatted"
+            echo "Run 'terraform fmt' to fix formatting issues"
+            exit 1
+          fi
+          echo "✅ All Terraform files are properly formatted"
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: |
+          echo "Validating Terraform configuration..."
+          terraform validate
+          echo "✅ Configuration validated successfully"
+
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform-changed == 'true'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov Security Scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: reports/results.sarif
+          quiet: false
+          soft_fail: true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: reports/results.sarif
+          category: checkov
+
+  plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate, security-scan]
+    if: |
+      needs.detect-changes.outputs.terraform-changed == 'true' &&
+      needs.validate.result == 'success' &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'failure')
+    
+    environment: production
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Cache Terraform Plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
 
       - name: Terraform Init
-        run: terraform init -no-color
+        id: init
+        run: |
+          echo "🔧 Initializing Terraform..."
+          terraform init -input=false -no-color
+          echo "✅ Terraform initialized successfully"
 
       - name: Terraform Plan
-        env:
-          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}  # if your provider uses var.project_id
-        run: terraform plan -input=false -no-color
+        id: plan
+        run: |
+          echo "🔍 Running terraform plan..."
+          
+          # Run terraform plan and capture output
+          if ! terraform plan -detailed-exitcode -input=false -no-color \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="region=us-central1" \
+            -out=tfplan 2>&1 | tee terraform_plan.log; then
+            echo "❌ Terraform plan command failed"
+            echo "📋 Full terraform output:"
+            cat terraform_plan.log
+            exit 1
+          fi
+          
+          # Save plan output for PR comments
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: tfplan
+          retention-days: 5
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync('tfplan.txt', 'utf8');
+            } catch (e) {
+              planOutput = 'Plan output not available';
+            }
+            
+            const comment = `## 📋 Terraform Plan Results
+            
+            **Plan Status**: \`${{ steps.plan.outcome }}\`
+            **Init Status**: \`${{ steps.init.outcome }}\`
+            
+            <details><summary>Show Plan Output</summary>
+            
+            \`\`\`hcl
+            ${planOutput.slice(0, 60000)}${planOutput.length > 60000 ? '\n\n... (truncated)' : ''}
+            \`\`\`
+            
+            </details>
+            
+            *Triggered by: @${{ github.actor }}*
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  deploy:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: [detect-changes, plan]
+    if: |
+      needs.detect-changes.outputs.terraform-changed == 'true' && 
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+      )
+    
+    environment: production
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: ./
+
+      - name: Terraform Init
+        run: |
+          echo "🔧 Initializing Terraform..."
+          terraform init -input=false -no-color
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        env:
-          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
-        run: terraform apply -auto-approve -input=false -no-color
+        id: apply
+        run: |
+          echo "🚀 Applying Terraform plan..."
+          terraform apply -input=false -no-color tfplan
+          echo "✅ Successfully applied Terraform configuration"
+
+      - name: Save Terraform Outputs
+        id: outputs
+        run: |
+          terraform output -json > outputs.json || echo "Failed to generate outputs"
+          if [ -f outputs.json ]; then
+            echo "outputs=$(cat outputs.json)" >> $GITHUB_OUTPUT
+          else
+            echo "outputs={}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Deployment Summary
+        if: github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## 🚀 Deployment Complete
+            
+            **Status**: ✅ Successfully deployed
+            **Project**: \`${{ secrets.GCP_PROJECT_ID }}\`
+            **Commit**: ${{ github.sha }}
+            **Deployed by**: @${{ github.actor }}
+            
+            ### Infrastructure Outputs
+            \`\`\`json
+            ${{ steps.outputs.outputs }}
+            \`\`\`
+            
+            🔗 [View in Google Cloud Console](https://console.cloud.google.com/storage/browser?project=${{ secrets.GCP_PROJECT_ID }})
+            `;
+            
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: comment
+            });
+
+  destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    
+    environment: production
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -input=false -no-color
+
+      - name: Terraform Destroy
+        run: |
+          echo "🗑️ Destroying Terraform infrastructure..."
+          terraform destroy -input=false -no-color -auto-approve \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="region=us-central1"
+          echo "✅ Infrastructure destroyed successfully"
