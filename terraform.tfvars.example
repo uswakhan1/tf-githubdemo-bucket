@@ -1,0 +1,4 @@
+# Default values for local development
+# In CI/CD, these will be overridden by environment variables
+project_id = "gmzdev"
+region     = "us-central1"
