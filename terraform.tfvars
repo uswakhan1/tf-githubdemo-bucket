@@ -1,3 +1,3 @@
 # Your GCP project configuration
-project_id = "dev-optimsync"
+project_id = "gmzdev"
 region     = "europe-west1"
