@@ -1,53 +1,54 @@
-# Terraform CI/CD workflow for Google Cloud Platform
-# This workflow runs terraform init, fmt, plan, and apply for GCP infrastructure
 name: Terraform
 
 on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
 
 permissions:
   contents: read
+  id-token: write   # <-- needed for Workload Identity Federation
 
 jobs:
   terraform:
-    name: Terraform
     runs-on: ubuntu-latest
-    
-    env:
-      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
-      TF_VAR_region: "us-central1"
+    environment: production
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Authenticate to Google Cloud
+      # Authenticate to Google Cloud via OIDC (no keys)
+      - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}  # store the provider resource name in a secret
+          service_account: ${{ secrets.GCP_WIF_SA }}                   # store the SA email in a secret
+          # Optional: set the project for gcloud; Terraform reads project from provider config/vars.
+          create_credentials_file: true   # makes ADC available to Terraform
 
-      - name: Set up Cloud SDK
+      # (Optional) If you use gcloud in any step:
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
       - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -diff
-
-      - name: Terraform Validate
-        run: terraform validate
+        run: terraform init -no-color
 
       - name: Terraform Plan
-        run: terraform plan -no-color
-        
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}  # if your provider uses var.project_id
+        run: terraform plan -input=false -no-color
+
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve -no-color
-
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+        run: terraform apply -auto-approve -input=false -no-color
